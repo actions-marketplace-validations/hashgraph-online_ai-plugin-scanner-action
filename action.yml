@@ -44,7 +44,7 @@ inputs:
     required: false
     default: "ai-plugin-scanner"
   write_step_summary:
-    description: "Write a concise markdown summary to the GitHub Actions job summary"
+    description: "Write the full report inline for markdown scans, otherwise write a concise GitHub Actions job summary"
     required: false
     default: "true"
   registry_payload_output:
@@ -67,14 +67,14 @@ inputs:
     description: "Cisco skill-scanner policy preset: permissive, balanced, or strict"
     required: false
     default: "balanced"
-  install_cisco:
-    description: "Install the opt-in Cisco skill-scanner dependency used by this repo"
-    required: false
-    default: "false"
   install_source:
     description: "Package install source: pypi for the reviewed release path, or local for source-repo dogfooding"
     required: false
     default: "pypi"
+  install_cisco:
+    description: "Install the opt-in Cisco skill-scanner dependency used by this repo"
+    required: false
+    default: "false"
   submission_enabled:
     description: "Open submission issues for awesome-list and registry automation when the plugin clears the submission threshold"
     required: false
@@ -198,7 +198,14 @@ runs:
       env:
         INSTALL_SOURCE: ${{ inputs.install_source }}
         INSTALL_CISCO: ${{ inputs.install_cisco }}
+        PYTHONNOUSERSITE: "1"
+        PYTHONSAFEPATH: "1"
       run: |
+        ACTION_RUNTIME_ROOT="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+        ACTION_RUNTIME_DIR="$(mktemp -d "$ACTION_RUNTIME_ROOT/hol-guard-action-XXXXXX")"
+        trap 'cd "$ACTION_RUNTIME_ROOT" 2>/dev/null || cd /; rm -rf "$ACTION_RUNTIME_DIR"' EXIT
+        cd "$ACTION_RUNTIME_DIR"
+
         LOCAL_SOURCE=""
         for candidate in "$GITHUB_ACTION_PATH" "$GITHUB_ACTION_PATH/.."; do
           if [ -f "$candidate/pyproject.toml" ] && [ -d "$candidate/src/codex_plugin_scanner" ]; then
@@ -209,47 +216,54 @@ runs:
 
         if [ "$INSTALL_SOURCE" = "local" ]; then
           if [ -z "$LOCAL_SOURCE" ]; then
-            echo "install_source=local requires the source repository checkout (for example: uses: ./action inside ai-plugin-scanner)." >&2
+            echo "install_source=local requires the hol-guard source checkout (for example: uses: ./action inside hol-guard)." >&2
             exit 1
           fi
-          if [ "$INSTALL_CISCO" = "true" ]; then
-            python3 -m pip install "$LOCAL_SOURCE[cisco]"
-          else
-            python3 -m pip install "$LOCAL_SOURCE"
-          fi
+          python3 -P -m pip install "$LOCAL_SOURCE[cisco]"
         elif [ "$INSTALL_SOURCE" = "pypi" ]; then
           SCANNER_VERSION_FILE="$GITHUB_ACTION_PATH/scanner-version.txt"
+          SCANNER_SHA256_FILE="$GITHUB_ACTION_PATH/scanner-sha256.txt"
           CISCO_VERSION_FILE="$GITHUB_ACTION_PATH/cisco-version.txt"
           PYPI_ATTESTATIONS_VERSION_FILE="$GITHUB_ACTION_PATH/pypi-attestations-version.txt"
-          if [ ! -f "$SCANNER_VERSION_FILE" ] || [ ! -f "$CISCO_VERSION_FILE" ] || [ ! -f "$PYPI_ATTESTATIONS_VERSION_FILE" ]; then
+          if [ ! -f "$SCANNER_VERSION_FILE" ] || [ ! -f "$SCANNER_SHA256_FILE" ] || [ ! -f "$CISCO_VERSION_FILE" ] || [ ! -f "$PYPI_ATTESTATIONS_VERSION_FILE" ]; then
             echo "Action install metadata files are missing from the Marketplace bundle." >&2
             exit 1
           fi
 
           SCANNER_VERSION="$(tr -d '[:space:]' < "$SCANNER_VERSION_FILE")"
+          EXPECTED_SHA256="$(tr -d '[:space:]' < "$SCANNER_SHA256_FILE")"
           CISCO_VERSION="$(tr -d '[:space:]' < "$CISCO_VERSION_FILE")"
           PYPI_ATTESTATIONS_VERSION="$(tr -d '[:space:]' < "$PYPI_ATTESTATIONS_VERSION_FILE")"
-          SCANNER_REPOSITORY="https://github.com/hashgraph-online/ai-plugin-scanner"
-          DIST_DIR="${RUNNER_TEMP:-$GITHUB_WORKSPACE/.ai-plugin-scanner-dist}"
+          SCANNER_REPOSITORY="https://github.com/hashgraph-online/hol-guard"
+          DIST_DIR="$ACTION_RUNTIME_DIR/ai-plugin-scanner-dist"
           mkdir -p "$DIST_DIR"
 
-          python3 -m pip install "pypi-attestations==${PYPI_ATTESTATIONS_VERSION}"
-          python3 -m pip download --only-binary=:all: --no-deps --dest "$DIST_DIR" "plugin-scanner==${SCANNER_VERSION}"
+          python3 -P -m pip install "pypi-attestations==${PYPI_ATTESTATIONS_VERSION}"
+          python3 -P -m pip download --only-binary=:all: --no-deps --dest "$DIST_DIR" "plugin-scanner==${SCANNER_VERSION}"
 
           DIST_BASENAME="$(
-            DIST_DIR="$DIST_DIR" python3 -c "import os; from pathlib import Path; dist_dir = Path(os.environ['DIST_DIR']); candidates = sorted(dist_dir.glob('plugin_scanner-*.whl')); expected = len(candidates) == 1; print(candidates[0].name) if expected else (_ for _ in ()).throw(SystemExit(f'Expected exactly one downloaded scanner wheel, found {len(candidates)}'))"
+            DIST_DIR="$DIST_DIR" python3 -P -c "import os, sys; from pathlib import Path; candidates = sorted(Path(os.environ['DIST_DIR']).glob('plugin_scanner-*.whl')); (len(candidates) == 1) or sys.exit(f'Expected exactly one downloaded scanner wheel, found {len(candidates)}'); print(candidates[0].name)"
           )"
 
-          if ! python3 -m pypi_attestations verify pypi \
+          ACTUAL_SHA256="$(
+            DIST_DIR="$DIST_DIR" DIST_BASENAME="$DIST_BASENAME" python3 -P -c "import hashlib, os; from pathlib import Path; wheel = Path(os.environ['DIST_DIR']) / os.environ['DIST_BASENAME']; print(hashlib.sha256(wheel.read_bytes()).hexdigest())"
+          )"
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "Downloaded scanner wheel SHA256 does not match scanner-sha256.txt." >&2
+            exit 1
+          fi
+
+          WHEEL_PATH="$DIST_DIR/$DIST_BASENAME"
+          if ! python3 -P -m pypi_attestations verify pypi \
             --repository "$SCANNER_REPOSITORY" \
-            "pypi:${DIST_BASENAME}"; then
+            "$WHEEL_PATH"; then
             echo "Failed to verify PyPI provenance for plugin-scanner==${SCANNER_VERSION}." >&2
             exit 1
           fi
 
-          python3 -m pip install "$DIST_DIR/$DIST_BASENAME"
+          python3 -P -m pip install "$WHEEL_PATH"
           if [ "$INSTALL_CISCO" = "true" ]; then
-            python3 -m pip install "cisco-ai-skill-scanner==${CISCO_VERSION}"
+            python3 -P -m pip install "cisco-ai-skill-scanner==${CISCO_VERSION}"
           fi
         else
           echo "Unsupported install_source: $INSTALL_SOURCE" >&2
@@ -269,7 +283,7 @@ runs:
         BASELINE: ${{ inputs.baseline }}
         ONLINE: ${{ inputs.online }}
         UPLOAD_SARIF: ${{ inputs.upload_sarif }}
-        WRITE_STEP_SUMMARY: ${{ inputs.write_step_summary }}
+        WRITE_STEP_SUMMARY: ${{ inputs.write_step_summary == 'true' && inputs.format != 'markdown' }}
         REGISTRY_PAYLOAD_OUTPUT: ${{ inputs.registry_payload_output }}
         MIN_SCORE: ${{ inputs.min_score }}
         FAIL_ON: ${{ inputs.fail_on_severity }}
@@ -289,11 +303,27 @@ runs:
         PR_COMMENT_STYLE: ${{ inputs.pr_comment_style }}
         PR_COMMENT_MAX_FINDINGS: ${{ inputs.pr_comment_max_findings }}
         GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
-      run: python3 -m codex_plugin_scanner.action_runner
+        PYTHONNOUSERSITE: "1"
+        PYTHONSAFEPATH: "1"
+      run: python3 -P -m codex_plugin_scanner.action_runner
+
+    - name: Publish Markdown report to job summary
+      if: ${{ inputs.write_step_summary == 'true' && inputs.mode == 'scan' && inputs.format == 'markdown' && steps.scan.outputs.report_path != '' }}
+      shell: bash
+      env:
+        REPORT_PATH: ${{ steps.scan.outputs.report_path }}
+      run: |
+        set -euo pipefail
+        if [ ! -s "$REPORT_PATH" ]; then
+          echo "Markdown report was requested for the job summary but was not generated: $REPORT_PATH" >&2
+          exit 1
+        fi
+        cat "$REPORT_PATH" >> "$GITHUB_STEP_SUMMARY"
+        printf '\n' >> "$GITHUB_STEP_SUMMARY"
 
     - name: Upload SARIF
       if: ${{ inputs.upload_sarif == 'true' && inputs.mode == 'scan' && steps.scan.outputs.report_path != '' }}
-      uses: github/codeql-action/upload-sarif@51f77329afa6477de8c49fc9c7046c15b9a4e79d
+      uses: github/codeql-action/upload-sarif@e46ed2cbd01164d986452f91f178727624ae40d7
       with:
         sarif_file: ${{ steps.scan.outputs.report_path }}
         category: ${{ inputs.sarif_category }}
